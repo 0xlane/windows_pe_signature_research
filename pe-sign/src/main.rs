@@ -108,27 +108,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(("verify", sub_matches)) => {
             let file = sub_matches.get_one::<PathBuf>("FILE").unwrap();
 
-            // 判断文件是否存在
-            if !file.exists() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("{} 文件不存在", file.to_str().unwrap()),
-                )
-                .into());
-            }
-
             // 解析 PE 文件，获取签名数据
-            let image = VecPE::from_disk_file(file.to_str().unwrap())?;
-            let security_directory =
-                image.get_data_directory(exe::ImageDirectoryEntry::Security)?;
-            let signature_data =
-                exe::Buffer::offset_to_ptr(&image, security_directory.virtual_address.into())?; // security_data_directory rva is equivalent to file offset
-            let signature_data =
-                unsafe { slice::from_raw_parts(signature_data, security_directory.size as usize) };
-            let signature_data = &signature_data[8..]; // _WIN_CERTIFICATE->bCertificate
+            let pkcs7_bin = extract_pkcs7_from_pe(file)?;
 
             // 解析 pkcs7
-            let pkcs7 = Pkcs7::from_der(signature_data)?;
+            let pkcs7 = Pkcs7::from_der(&pkcs7_bin)?;
 
             // 打印签名者信息
             let mut empty_certs = Stack::new().unwrap();
