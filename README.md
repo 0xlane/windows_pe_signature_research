@@ -34,11 +34,19 @@ typedef struct _WIN_CERTIFICATE {
 找到 Security Directory 偏移之后，跳过前面的 8 字节就是实际的 PKCS #7 证书内容，DER 格式，代码示意：
 
 ```rust
-let image = VecPE::from_disk_file(file.to_str().unwrap())?;
-let security_directory =
-    image.get_data_directory(exe::ImageDirectoryEntry::Security)?;
-let signature_data =
-    exe::Buffer::offset_to_ptr(&image, security_directory.virtual_address.into())?; // security_data_directory rva is equivalent to file offset
+fn extract_pkcs7_from_pe(file: &PathBuf) -> Result<Vec<u8>, Box<dyn Error>> {
+    // ...
+    let image = VecPE::from_disk_file(file.to_str().unwrap())?;
+    let security_directory =
+        image.get_data_directory(exe::ImageDirectoryEntry::Security)?;
+    let signature_data =
+        exe::Buffer::offset_to_ptr(&image, security_directory.virtual_address.into())?; // security_data_directory rva is equivalent to file offset
+
+    Ok(unsafe {
+        let vec = std::slice::from_raw_parts(signature_data, security_directory.size as usize).to_vec();    // cloned
+        vec.into_iter().skip(8).collect()   // _WIN_CERTIFICATE->bCertificate
+    })
+}
 ```
 
 使用项目中的 pe-sign 工具可以直接导出：
