@@ -1281,7 +1281,7 @@ PKCS7:
 
 > szOID_NESTED_SIGNATURE 是一个表示嵌套签名的对象标识符（OID），其对应的 OID 是 1.3.6.1.4.1.311.2.4.1。在 PKCS7 或 CMS（Cryptographic Message Syntax）中，嵌套签名允许在签名数据中嵌套另一个签名数据块。这种机制用于实现多层次的签名或加密操作。
 
-使用 openssl 的 ans1parse 命令可以找出嵌套签名的偏移位置：
+使用 openssl 的 asn1parse 命令可以找出嵌套签名的偏移位置：
 
 ```powershell
 PS C:\dev\windows_pe_signature_research> openssl asn1parse -i -inform DER -in \pkcs7.cer | Select-String -Context 1,3 1.3.6.1.4.1.311.2.4.1
