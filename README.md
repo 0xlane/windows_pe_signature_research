@@ -1265,3 +1265,194 @@ PKCS7:
  6945:d=14 hl=2 l=   0 prim:               NULL
  6947:d=13 hl=4 l= 256 prim:              OCTET STRING      [HEX DUMP]:3C01A60213C476A0E9E532921CCF29E28628536561FE500B37D16D6B8BD325732310775033C96BB668F797EE0CBCA7370110D27BC2246D068C924AE0D5CB9181B2DF37C7613E81AED98D8FA24BF4B0C6120026C85AE7019CA70634F537AE82591884EDB0AB93183C0F69399A5220E92914840B21E1B517590D6FD07BA5F7BA12B3E0A8714B9AF84A0983FC92BFB32191A870AE29EF379FBA00D760220B4F7EEB2BC9FFC12B16966CF8020BE98E9A11165355C8E6BC967F27170D93852C2F71BF556EB547BBAE4339D1762F06ECDD34ABB1D2323BE9C91A3329565D8163F5E267EAFA67A4B0953B22E00E866FA589D165A5654CA00C77B5B4DFC196AE98DEFB81
 ```
+
+看了下微步沙箱也只解析到了1个签名：[https://s.threatbook.com/report/file/bd2c2cf0631d881ed382817afcce2b093f4e412ffb170a719e2762f250abfea4](https://s.threatbook.com/report/file/bd2c2cf0631d881ed382817afcce2b093f4e412ffb170a719e2762f250abfea4)
+
+经过一番观察，发现 sha256 这个证书是在 sha1 证书属性里内嵌的，并不是平级：
+
+![cert_embedded_in_cert_attribute](assets/cert_embedded_in_cert_attribute.png)
+
+然后就搜了一个这个属性名 1.3.6.1.4.1.311.2.4.1 有什么特殊的地方，从 [MSDN](https://learn.microsoft.com/en-us/previous-versions/hh968145(v=vs.85)) 可知，这个值表示的是 szOID_NESTED_SIGNATURE 内容（实际就是一个 pkcs#7 格式证书），ChatGPT 是这么解释这个属性的：
+
+> szOID_NESTED_SIGNATURE 是一个表示嵌套签名的对象标识符（OID），其对应的 OID 是 1.3.6.1.4.1.311.2.4.1。。在 PKCS7 或 CMS（Cryptographic Message Syntax）中，嵌套签名允许在签名数据中嵌套另一个签名数据块。这种机制用于实现多层次的签名或加密操作。
+
+使用 openssl 的 ans1parse 命令可以找出嵌套签名的偏移位置：
+
+```powershell
+PS C:\dev\windows_pe_signature_research> openssl asn1parse -i -inform DER -in \pkcs7.cer | Select-String -Context 1,3 1.3.6.1.4.1.311.2.4.1
+
+   7638:d=6  hl=4 l=7223 cons:       SEQUENCE
+>  7642:d=7  hl=2 l=  10 prim:        OBJECT            :1.3.6.1.4.1.311.2.4.1
+   7654:d=7  hl=4 l=7207 cons:        SET
+   7658:d=8  hl=4 l=7203 cons:         SEQUENCE
+   7662:d=9  hl=2 l=   9 prim:          OBJECT            :pkcs7-signedData
+```
+
+SET 后面开始就是嵌入数据，7658 就是嵌套数据开始的文件偏移，hl 表示头大小，l 表示数据大小，所以总的嵌套数据大小为 4+7203=7207。使用 powershell 提取这个嵌套签名：
+
+```powershell
+$offset = 7658
+$size = 7207
+$fileStream = [System.IO.File]::OpenRead(".\pkcs7.cer")
+$buffer = New-Object byte[] $size
+$fileStream.Seek($offset, [System.IO.SeekOrigin]::Begin)
+$fileStream.Read($buffer, 0, $size)
+$fileStream.Close()
+[System.IO.File]::WriteAllBytes(".\pkcs7_embed.cer", $buffer)
+```
+
+再次使用 openssl 就可以解析出这个嵌套签名证书：
+
+```powershell
+PS C:\dev\windows_pe_signature_research> openssl pkcs7 -inform der -in .\pkcs7_embed.cer -print_certs -text -noout
+Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number:
+            04:0c:b4:1e:4f:b3:70:c4:5c:43:44:76:51:62:58:2f
+        Signature Algorithm: sha256WithRSAEncryption
+        Issuer: C=US, O=DigiCert Inc, OU=www.digicert.com, CN=DigiCert SHA2 High Assurance Code Signing CA
+        Validity
+            Not Before: Oct 30 00:00:00 2013 GMT
+            Not After : Jan  4 12:00:00 2017 GMT
+        Subject: C=AU, ST=New South Wales, L=Sydney, O=Wen Jia Liu, CN=Wen Jia Liu
+        Subject Public Key Info:
+            Public Key Algorithm: rsaEncryption
+                Public-Key: (2048 bit)
+                Modulus:
+                    00:97:a8:e8:af:59:2a:05:f3:d5:0e:36:66:eb:89:
+                    95:52:1a:3b:dd:41:12:63:b2:81:b9:f4:d0:cb:3d:
+                    df:7d:f5:9b:f1:55:35:c0:9b:0a:ae:39:f6:ed:d8:
+                    da:58:dd:ab:0e:ca:ce:b2:de:de:f0:fd:9d:6d:77:
+                    1e:9d:05:ae:51:e6:02:27:8d:a4:c2:43:2f:2b:07:
+                    cf:04:0b:00:a0:46:5d:61:13:f6:a3:b6:ab:bd:04:
+                    b3:e4:b6:a2:9e:bd:94:d6:95:cf:28:bb:d9:5f:dc:
+                    fb:06:2c:52:00:3d:63:6c:64:f8:68:ca:02:5a:1f:
+                    25:b8:1c:d5:af:6e:bb:11:61:c0:f5:72:97:32:c1:
+                    66:af:41:b8:7b:59:b0:da:e5:5b:9b:25:db:56:b4:
+                    44:fc:52:5f:44:40:3b:5f:b0:02:37:53:d1:9f:96:
+                    a5:a0:a5:47:87:19:c8:3d:a6:5b:91:05:01:b1:d4:
+                    00:96:14:31:80:04:8a:e0:a6:a3:a5:32:31:92:37:
+                    1a:93:85:da:b1:e9:79:ec:1a:bb:a6:1a:34:c7:70:
+                    80:2d:8a:d6:89:38:d3:8c:54:ae:6e:86:3d:3a:c5:
+                    49:d6:72:7b:b7:94:b6:6b:ee:f0:d0:70:11:c2:f0:
+                    a2:5d:d8:87:5c:47:a4:7e:8e:36:29:d5:64:cf:49:
+                    79:85
+                Exponent: 65537 (0x10001)
+        X509v3 extensions:
+            X509v3 Authority Key Identifier:
+                67:9D:0F:20:09:0C:CC:8A:3A:E5:82:46:72:62:FC:F1:CC:90:E5:40
+            X509v3 Subject Key Identifier:
+                13:86:9A:3B:EF:68:31:53:BC:6B:18:9B:34:C6:FF:0A:8B:4D:68:28
+            X509v3 Key Usage: critical
+                Digital Signature
+            X509v3 Extended Key Usage:
+                Code Signing
+            X509v3 CRL Distribution Points:
+                Full Name:
+                  URI:http://crl3.digicert.com/sha2-ha-cs-g1.crl
+                Full Name:
+                  URI:http://crl4.digicert.com/sha2-ha-cs-g1.crl
+            X509v3 Certificate Policies:
+                Policy: 2.16.840.1.114412.3.1
+                  CPS: https://www.digicert.com/CPS
+                Policy: 2.23.140.1.4.1
+            Authority Information Access:
+                OCSP - URI:http://ocsp.digicert.com
+                CA Issuers - URI:http://cacerts.digicert.com/DigiCertSHA2HighAssuranceCodeSigningCA.crt
+            X509v3 Basic Constraints: critical
+                CA:FALSE
+    Signature Algorithm: sha256WithRSAEncryption
+    Signature Value:
+        91:87:ac:23:c2:84:07:cb:c7:6a:c1:f8:1a:6c:78:3b:21:9f:
+        c2:48:1b:08:e8:f5:e3:41:f7:eb:e2:d9:41:b1:48:e6:1b:ff:
+        55:ab:79:c1:a2:d8:16:7a:2d:d2:94:f5:32:c8:00:5a:5f:dd:
+        f2:f8:b2:19:86:47:fb:e7:aa:a7:16:e6:ff:0a:c3:37:f9:64:
+        c0:5b:51:64:ef:8a:23:c4:7a:d0:8f:d7:37:b8:70:dd:35:6f:
+        19:06:4e:a5:cd:ea:0a:ef:a4:f2:2a:1c:b3:49:f8:a6:89:ac:
+        a5:67:f3:8b:b3:de:01:23:20:4f:9f:f5:56:0c:59:ec:e4:01:
+        32:3f:2c:e5:84:be:e0:ea:5b:b7:39:31:26:ff:32:7f:eb:15:
+        cc:82:d0:b0:16:f8:fc:6f:1d:c8:b2:1b:9c:85:68:27:7d:45:
+        b0:e0:7a:7c:dd:26:f4:9a:d4:7d:0f:a6:ac:04:c1:48:65:1c:
+        ef:49:33:0b:d2:c7:28:95:a7:26:51:09:cf:1a:f0:d2:ca:74:
+        93:92:8c:e3:44:6e:24:5b:57:9f:b2:cc:df:01:e0:3d:b4:7f:
+        41:cc:97:d6:ea:3d:1f:42:3d:fd:2b:75:82:0c:43:50:e9:d8:
+        ac:d1:d9:e6:e4:08:97:05:75:29:55:be:2d:89:7d:ab:16:5e:
+        be:32:e0:b5
+
+Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number:
+            0b:7e:10:90:3c:38:49:0f:fa:2f:67:9a:87:a1:a7:b9
+        Signature Algorithm: sha256WithRSAEncryption
+        Issuer: C=US, O=DigiCert Inc, OU=www.digicert.com, CN=DigiCert High Assurance EV Root CA
+        Validity
+            Not Before: Oct 22 12:00:00 2013 GMT
+            Not After : Oct 22 12:00:00 2028 GMT
+        Subject: C=US, O=DigiCert Inc, OU=www.digicert.com, CN=DigiCert SHA2 High Assurance Code Signing CA
+        Subject Public Key Info:
+            Public Key Algorithm: rsaEncryption
+                Public-Key: (2048 bit)
+                Modulus:
+                    00:b4:4a:5e:7d:07:0f:41:de:c4:f5:76:16:36:bd:
+                    71:ff:cf:3f:4f:73:4b:9c:d1:0d:fe:4a:cb:57:58:
+                    5e:85:16:dd:02:15:54:99:f0:8f:3c:2f:4d:02:78:
+                    10:68:c8:d8:35:4b:3f:c1:f7:67:ce:98:1c:ae:33:
+                    b9:2d:1d:a4:0a:54:93:c4:85:a2:df:35:b1:f5:f1:
+                    3c:a7:b3:34:fb:5d:48:c9:46:c9:62:44:bc:48:99:
+                    eb:28:49:53:c3:3d:8f:c0:0e:de:35:98:e9:62:51:
+                    df:3d:6b:40:61:ee:04:41:da:cf:a7:5c:56:96:d1:
+                    f9:4c:b7:44:84:87:98:69:e5:82:b9:13:e6:55:bf:
+                    c8:92:70:92:0a:31:6f:7f:8b:32:ab:cf:6b:5a:9f:
+                    62:c4:3e:ee:be:ed:59:a4:53:7f:0b:f1:52:88:8a:
+                    7b:0a:67:24:cb:90:cd:ec:d2:4d:34:4c:b0:e1:b5:
+                    9f:9c:c6:f6:6f:2c:cd:e6:ca:53:74:01:9f:67:35:
+                    de:38:49:2d:ce:ed:39:44:82:19:79:4e:1a:b2:b5:
+                    fb:bb:78:f0:49:66:a7:cf:fa:5c:96:75:92:8b:1a:
+                    72:d9:ff:50:92:53:cc:3e:c2:43:32:09:1a:86:13:
+                    69:3c:fb:81:32:33:32:64:75:73:28:26:1d:08:30:
+                    3b:07
+                Exponent: 65537 (0x10001)
+        X509v3 extensions:
+            X509v3 Basic Constraints: critical
+                CA:TRUE, pathlen:0
+            X509v3 Key Usage: critical
+                Digital Signature, Certificate Sign, CRL Sign
+            X509v3 Extended Key Usage:
+                Code Signing
+            Authority Information Access:
+                OCSP - URI:http://ocsp.digicert.com
+                CA Issuers - URI:http://cacerts.digicert.com/DigiCertHighAssuranceEVRootCA.crt
+            X509v3 CRL Distribution Points:
+                Full Name:
+                  URI:http://crl4.digicert.com/DigiCertHighAssuranceEVRootCA.crl
+                Full Name:
+                  URI:http://crl3.digicert.com/DigiCertHighAssuranceEVRootCA.crl
+            X509v3 Certificate Policies:
+                Policy: 2.16.840.1.114412.0.2.4
+                  CPS: https://www.digicert.com/CPS
+                Policy: 2.16.840.1.114412.3
+            X509v3 Subject Key Identifier:
+                67:9D:0F:20:09:0C:CC:8A:3A:E5:82:46:72:62:FC:F1:CC:90:E5:40
+            X509v3 Authority Key Identifier:
+                B1:3E:C3:69:03:F8:BF:47:01:D4:98:26:1A:08:02:EF:63:64:2B:C3
+    Signature Algorithm: sha256WithRSAEncryption
+    Signature Value:
+        6a:0e:ff:7e:13:7c:06:a5:4b:c0:2e:8c:f9:53:64:09:e2:ba:
+        58:91:30:50:ec:cc:9f:e1:d3:a8:2f:48:46:36:18:29:d0:78:
+        28:5f:98:56:40:0f:1e:ba:bd:b1:3b:87:5c:dc:5b:d8:20:0d:
+        ed:1a:16:4d:d5:11:24:21:4b:f1:27:69:90:13:eb:11:a1:01:
+        da:fd:b5:4e:79:59:75:bd:38:2a:6a:c3:f6:8e:41:2b:8a:a2:
+        8b:d7:2c:51:51:d9:9c:a0:c8:e3:4e:ba:6c:a8:47:d2:4e:d1:
+        68:1f:8c:02:57:3b:b3:29:6a:8e:6a:20:2a:b9:f2:00:62:64:
+        ba:c8:e9:00:f9:cc:a4:d4:ba:9a:35:d8:af:2c:65:6c:16:7c:
+        58:21:de:4a:30:d0:fa:eb:24:5d:06:c9:9d:16:b7:ad:4a:45:
+        d3:25:e2:0c:f0:40:aa:5c:4d:ac:7e:cd:06:82:b9:76:46:69:
+        08:d8:32:b6:82:fe:e3:a9:58:34:43:1b:8e:67:67:97:3f:68:
+        31:16:36:38:95:3e:87:f7:c7:c3:af:9d:7a:77:19:d9:de:93:
+        b5:fd:6e:2b:fc:94:f9:3d:b7:4c:12:35:2c:30:be:e8:8d:9e:
+        05:70:9a:48:13:f4:8c:d6:e7:1e:ac:38:e7:a8:f3:ad:0c:b7:
+        7a:ec:67:ed
+
+```
