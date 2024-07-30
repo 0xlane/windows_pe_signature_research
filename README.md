@@ -75,6 +75,9 @@ openssl pkcs7 -inform DER -in .\pkcs7.cer -print_certs -text -noout
 
 openssl 打印的证书信息只有 sha1 证书的，使用 `-print` 参数打印 pkcs7 结构也可以看到是有 sha256 证书内容的但是没正确解析：
 
+<details>
+<summary>-print 解析结果</summary>
+
 ```powershell
 PS C:\dev\windows_pe_signature_research> openssl pkcs7 -inform DER -in .\pkcs7.cer -print -text -noout
 PKCS7:
@@ -1266,6 +1269,8 @@ PKCS7:
  6947:d=13 hl=4 l= 256 prim:              OCTET STRING      [HEX DUMP]:3C01A60213C476A0E9E532921CCF29E28628536561FE500B37D16D6B8BD325732310775033C96BB668F797EE0CBCA7370110D27BC2246D068C924AE0D5CB9181B2DF37C7613E81AED98D8FA24BF4B0C6120026C85AE7019CA70634F537AE82591884EDB0AB93183C0F69399A5220E92914840B21E1B517590D6FD07BA5F7BA12B3E0A8714B9AF84A0983FC92BFB32191A870AE29EF379FBA00D760220B4F7EEB2BC9FFC12B16966CF8020BE98E9A11165355C8E6BC967F27170D93852C2F71BF556EB547BBAE4339D1762F06ECDD34ABB1D2323BE9C91A3329565D8163F5E267EAFA67A4B0953B22E00E866FA589D165A5654CA00C77B5B4DFC196AE98DEFB81
 ```
 
+</details>
+
 看了下微步沙箱也只解析到了1个签名：[https://s.threatbook.com/report/file/bd2c2cf0631d881ed382817afcce2b093f4e412ffb170a719e2762f250abfea4](https://s.threatbook.com/report/file/bd2c2cf0631d881ed382817afcce2b093f4e412ffb170a719e2762f250abfea4)
 
 经过一番观察，发现 sha256 这个证书是在 sha1 证书属性里内嵌的，并不是平级：
@@ -1274,7 +1279,7 @@ PKCS7:
 
 然后就搜了一个这个属性名 1.3.6.1.4.1.311.2.4.1 有什么特殊的地方，从 [MSDN](https://learn.microsoft.com/en-us/previous-versions/hh968145(v=vs.85)) 可知，这个值表示的是 szOID_NESTED_SIGNATURE 内容（实际就是一个 pkcs#7 格式证书），ChatGPT 是这么解释这个属性的：
 
-> szOID_NESTED_SIGNATURE 是一个表示嵌套签名的对象标识符（OID），其对应的 OID 是 1.3.6.1.4.1.311.2.4.1。。在 PKCS7 或 CMS（Cryptographic Message Syntax）中，嵌套签名允许在签名数据中嵌套另一个签名数据块。这种机制用于实现多层次的签名或加密操作。
+> szOID_NESTED_SIGNATURE 是一个表示嵌套签名的对象标识符（OID），其对应的 OID 是 1.3.6.1.4.1.311.2.4.1。在 PKCS7 或 CMS（Cryptographic Message Syntax）中，嵌套签名允许在签名数据中嵌套另一个签名数据块。这种机制用于实现多层次的签名或加密操作。
 
 使用 openssl 的 ans1parse 命令可以找出嵌套签名的偏移位置：
 
