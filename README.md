@@ -2,7 +2,7 @@
 
 ## 导出签名数据
 
-具体的 PE 格式可以参考 [msdn](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format)。
+具体的 PE 格式可以参考 [MSDN](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format)。
 
 签名证书的位置在 Certificate Table 里（也称为 Security Directory）：
 
@@ -1271,7 +1271,7 @@ PKCS7:
 
 </details>
 
-看了下微步沙箱也只解析到了1个签名：[https://s.threatbook.com/report/file/bd2c2cf0631d881ed382817afcce2b093f4e412ffb170a719e2762f250abfea4](https://s.threatbook.com/report/file/bd2c2cf0631d881ed382817afcce2b093f4e412ffb170a719e2762f250abfea4)
+看了下微步沙箱也只解析到了 1 个签名：[https://s.threatbook.com/report/file/bd2c2cf0631d881ed382817afcce2b093f4e412ffb170a719e2762f250abfea4](https://s.threatbook.com/report/file/bd2c2cf0631d881ed382817afcce2b093f4e412ffb170a719e2762f250abfea4)
 
 ## 解析内嵌证书
 
@@ -1279,7 +1279,7 @@ PKCS7:
 
 ![cert_embedded_in_cert_attribute](assets/cert_embedded_in_cert_attribute.png)
 
-然后就搜了一个这个属性名 1.3.6.1.4.1.311.2.4.1 有什么特殊的地方，从 [MSDN](https://learn.microsoft.com/en-us/previous-versions/hh968145(v=vs.85)) 可知，这个值表示的是 szOID_NESTED_SIGNATURE 内容（实际就是一个 pkcs#7 格式证书），ChatGPT 是这么解释这个属性的：
+然后就搜了一个这个属性名 `1.3.6.1.4.1.311.2.4.1` 有什么特殊的地方，从 [MSDN](https://learn.microsoft.com/en-us/previous-versions/hh968145(v=vs.85)) 可知，这个值表示的是 `szOID_NESTED_SIGNATURE` 内容（实际就是一个 pkcs#7 格式证书），ChatGPT 是这么解释这个属性的：
 
 > szOID_NESTED_SIGNATURE 是一个表示嵌套签名的对象标识符（OID），其对应的 OID 是 1.3.6.1.4.1.311.2.4.1。在 PKCS7 或 CMS（Cryptographic Message Syntax）中，嵌套签名允许在签名数据中嵌套另一个签名数据块。这种机制用于实现多层次的签名或加密操作。
 
@@ -1485,13 +1485,13 @@ $fileStream.Close()
 Write-Host $(($buffer | ForEach-Object { "{0:x2}" -f $_ }) -join " ")
 ```
 
-可以发现有些数字是可以直接能和 `1.3.6.1.4.1.311.2.4.1` 上的：
+可以发现有些数字是可以直接能和 `1.3.6.1.4.1.311.2.4.1` 对应上的：
 
 ```powershell
 2b . 06 . 01 . 04 . 01 . 82 37 . 02 . 04 01
 ```
 
-不难看出，这里的 `2b` 就是表示的 `1.3`，`82 37` 表示的 `311`。但是 `13` 的十六进制表示为 `D`、`311` 的十六进制表示为 `137`，所以这里并不是直接的10-16转换关系。查了一些 OID 的资料，在 [这篇文章](https://letsencrypt.org/zh-cn/docs/a-warm-welcome-to-asn1-and-der/#object-identifier-%E7%9A%84%E7%BC%96%E7%A0%81) 中找到了关于一些 OID 编码方式的描述：
+不难看出，这里的 `2b` 就是表示的 `1.3`，`82 37` 表示的 `311`。但是 `13` 的十六进制表示为 `D`、`311` 的十六进制表示为 `137`，所以这里并不是直接的10-16转换关系。查了一些 OID 的资料，在 [这篇文章](https://letsencrypt.org/zh-cn/docs/a-warm-welcome-to-asn1-and-der/#object-identifier-%E7%9A%84%E7%BC%96%E7%A0%81) 中找到了一些关于 OID 编码方式的描述：
 
 > OID 的实质就是一串整数， 而且至少由两个整数组成。 第一个数必须是 0、1、2 三者之一， 如果是 0 或 1，则第二个数必须小于 40。 因此，前两个数 X 和 Y 可以直接用 40×X+Y 来表示，不会产生歧义。
 >
@@ -1501,15 +1501,17 @@ Write-Host $(($buffer | ForEach-Object { "{0:x2}" -f $_ }) -join " ")
 >
 > 无论是在 BER 还是 DER 中，OID 都必须用最短的方式编码。 所以其中每个数字编码时开头都不能出现 0x80 字节。
 
-所以只有开头的 1.3 编码方式和后面不一样，后面都是 Base 128 编码。`1.3` 需要先按公式变成 `40x1+3 = 43`，再转换为十六进制就是 `2b`。反着推就是 `2b` 的十进制表示为 `43`，需要先确定第一位，因为只能是 0、1、2，0 和 1 时第二个数不能超过 40，所以可以知道第一位：
+所以只有开头的 `1.3` 编码方式和后面不一样，后面都是 Base 128 编码。`1.3` 需要先按公式变成 `40x1+3 = 43`，再转换为十六进制就是 `2b`。反着推就是 `2b` 的十进制表示为 `43`，需要先确定第一位，因为只能是 0、1、2。
+
+0 和 1 时第二个数不能超过 40，所以可以知道第一位：
 
 - 是 0 时，最终得到的十进制数字在 [0, 40) 之间
 - 是 1 时，最终得到的十进制数字在 [40, 80) 之间
 - 是 2 时，最终得到的十进制数字在 [80, 255) 之间（我感觉开头两位长度是固定的 1 字节，所以超不过 255，不可能出现上面文章说的 1079 的情况）
 
-所以 `43` 在 [40, 80) 之间，第一位应该是 1，第二位就是 `43 - 40x1 = 3`。
+所以 `43` 在 [40, 80) 之间，第一位应该是 `1`，第二位就是 `43 - 40x1 = 3`。
 
-后面每个数字都由 Base 128 编码方式存储，即数字在 128 以内（不包含 128）不需要转换直接存储，所以在上面能看到有些个位数的数字能直接对应上。128 之后就需要转成二进制从右向左每 7 位拆分一次，例如 `311` 的二进制表示为 `100110111`，每 7 位拆分 1 次变成：
+后面每个数字都由 Base 128 编码方式存储，即数字在 128 (0x80) 以内（不包含 128）不需要转换直接存储，所以在上面能看到有些个位数的数字能直接对应上。128 之后就需要转成二进制从右向左每 7 位拆分一次，例如 `311` 的二进制表示为 `100110111`，每 7 位拆分 1 次变成：
 
 ```powershell
 10  0110111
