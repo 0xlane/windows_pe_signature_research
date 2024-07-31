@@ -1273,6 +1273,8 @@ PKCS7:
 
 看了下微步沙箱也只解析到了1个签名：[https://s.threatbook.com/report/file/bd2c2cf0631d881ed382817afcce2b093f4e412ffb170a719e2762f250abfea4](https://s.threatbook.com/report/file/bd2c2cf0631d881ed382817afcce2b093f4e412ffb170a719e2762f250abfea4)
 
+## 解析内嵌证书
+
 经过一番观察，发现 sha256 这个证书是在 sha1 证书属性里内嵌的，并不是平级：
 
 ![cert_embedded_in_cert_attribute](assets/cert_embedded_in_cert_attribute.png)
@@ -1460,4 +1462,127 @@ Certificate:
         05:70:9a:48:13:f4:8c:d6:e7:1e:ac:38:e7:a8:f3:ad:0c:b7:
         7a:ec:67:ed
 
+```
+
+### 导出内嵌证书
+
+代码解析的话，需要按 ASN.1 结构手动解析，因为这里找的内容算是个固定的，只需要定位 `1.3.6.1.4.1.311.2.4.1` 所在位置就可以。所以就需要研究一下 OID 在证书内是以怎么方式存储的，根据之前 openssl 的 asn1parse 命令的结果可以知道偏移位置 7642 + 2 处为 `1.3.6.1.4.1.311.2.4.1`，长度 10：
+
+```powershell
+>  7642:d=7  hl=2 l=  10 prim:        OBJECT            :1.3.6.1.4.1.311.2.4.1
+```
+
+用下面的代码读取出来为 `2b 06 01 04 01 82 37 02 04 01`：
+
+```powershell
+$offset = 7644
+$size = 10
+$fileStream = [System.IO.File]::OpenRead(".\pkcs7.cer")
+$buffer = New-Object byte[] $size
+$fileStream.Seek($offset, [System.IO.SeekOrigin]::Begin)
+$fileStream.Read($buffer, 0, $size)
+$fileStream.Close()
+Write-Host $(($buffer | ForEach-Object { "{0:x2}" -f $_ }) -join " ")
+```
+
+可以发现有些数字是可以直接能和 `1.3.6.1.4.1.311.2.4.1` 上的：
+
+```powershell
+2b . 06 . 01 . 04 . 01 . 82 37 . 02 . 04 01
+```
+
+不难看出，这里的 `2b` 就是表示的 `1.3`，`82 37` 表示的 `311`。但是 `13` 的十六进制表示为 `D`、`311` 的十六进制表示为 `137`，所以这里并不是直接的10-16转换关系。查了一些 OID 的资料，在 [这篇文章](https://letsencrypt.org/zh-cn/docs/a-warm-welcome-to-asn1-and-der/#object-identifier-%E7%9A%84%E7%BC%96%E7%A0%81) 中找到了关于一些 OID 编码方式的描述：
+
+> OID 的实质就是一串整数， 而且至少由两个整数组成。 第一个数必须是 0、1、2 三者之一， 如果是 0 或 1，则第二个数必须小于 40。 因此，前两个数 X 和 Y 可以直接用 40×X+Y 来表示，不会产生歧义。
+>
+> 以 2.999.3 的编码为例，首先要将前两个数合并成 1079（即 40×2+999），得到 1079.3。
+>
+> 完成合并后再用 Base 128 编码，左侧为高位字节。 也就是说，每个字节的最高位设为 1，但最后一个字节最高位设为 0，表示一个整数到此结束。各字节的其余七位从高到低依次相连表示数值。 例如数字 3 就用一个字节 0x03 表示， 而 129 则需要两个字节 0x81 0x01。 每个数字都如此转换成字节后，拼接在一起就形成了 OID 的编码。
+>
+> 无论是在 BER 还是 DER 中，OID 都必须用最短的方式编码。 所以其中每个数字编码时开头都不能出现 0x80 字节。
+
+所以只有开头的 1.3 编码方式和后面不一样，后面都是 Base 128 编码。`1.3` 需要先按公式变成 `40x1+3 = 43`，再转换为十六进制就是 `2b`。反着推就是 `2b` 的十进制表示为 `43`，需要先确定第一位，因为只能是 0、1、2，0 和 1 时第二个数不能超过 40，所以可以知道第一位：
+
+- 是 0 时，最终得到的十进制数字在 [0, 40) 之间
+- 是 1 时，最终得到的十进制数字在 [40, 80) 之间
+- 是 2 时，最终得到的十进制数字在 [80, 255) 之间（我感觉开头两位长度是固定的 1 字节，所以超不过 255，不可能出现上面文章说的 1079 的情况）
+
+所以 `43` 在 [40, 80) 之间，第一位应该是 1，第二位就是 `43 - 40x1 = 3`。
+
+后面每个数字都由 Base 128 编码方式存储，即数字在 128 以内（不包含 128）不需要转换直接存储，所以在上面能看到有些个位数的数字能直接对应上。128 之后就需要转成二进制从右向左每 7 位拆分一次，例如 `311` 的二进制表示为 `100110111`，每 7 位拆分 1 次变成：
+
+```powershell
+10  0110111
+```
+
+前面补 0 变 8 位：
+
+```powershell
+00000010  00110111
+```
+
+除最后 1 个字节（8 位）不需要动，前面每个字节最高位变成 1：
+
+```powershell
+10000010  00110111
+```
+
+最后变成 十六进制看就是 `82 37`。
+
+现在对 `2b 06 01 04 01 82 37 02 04 01` 整体反向解析一下，开头两位前面说过了，`2b` 表示 `1.3`，后面的数字需要 1 个接 1 个字节换成二进制形式地看：
+
+- 先看 `06` 二进制表示为 `00000110`，开头是 0，所以直接转换为 `6`，`01 04 01` 同理表示的 `1.4.1`
+- 到 `82` 二进制形式为 `10000010`，开头是 1 表示还有后续，`37` 二进制形式为 `00110111`，开头是 0 表示当前数字结束了，`82 37` 是一个整体，整体换成二进制 `10000010 00110111`，去掉每个字节的最高位连起来就是 `0000010 0110111`，即 `311`
+- 后面的 `02 04 01` 都不超过 128，所以和前面一样是直接存储的不需要转换，表示的 `2.4.1`
+
+合起来最终得到 `1.3.6.1.4.1.311.2.4.1`。
+
+搞明白这个之后，可以直接通过 `2b 06 01 04 01 82 37 02 04 01` 定位到后 1 位再向后偏移 4 字节跳过 SET 块就是 `SEQUENCE`，此处便是内嵌证书的开头位置，一般直接读取到结尾就可以，严谨一点的话需要解析一下头部位置：
+
+```powershell
+30 82 1C 23
+```
+
+第 1 个字节是标签，30 表示 `SEQUENCE` 不用管，第二个字节最高位被设置为 1 的时候代表长编码，为 0 表示短编码，短编码时该字节就表示内容的长度，长编码时该字节表示存储长度的字节大小，`0x82` 最高位为 1，所以是长编码形式，去掉最高位的 1 就是 `0x2`，表示后面有 2 个字节用来表示 `SEQUENCE` 内容的长度，即 `0x1c23`，加上头的长度，这里是 `4`，内嵌证书长度就是 `0x1c27`。
+
+代码实现：
+
+```rust
+fn extract_pkcs7_embedded<'a>(cert_bin: &'a [u8]) -> Option<&'a [u8]> {
+    match cert_bin.windows(EMBEDDED_SIGNATURE_OID.len()).position(|w| w == EMBEDDED_SIGNATURE_OID) {
+        Some(pos) => {
+            let sequence_pos = pos + EMBEDDED_SIGNATURE_OID.len() + 4;
+            let mut header_len = 1;
+
+            let size = if cert_bin[sequence_pos + 1] >= 0b10000000 {
+                // 长编码
+                let len = (cert_bin[sequence_pos + 1] & 0b01111111) as usize;
+                header_len += 1 + len;
+                let size_bin = &mut cert_bin[sequence_pos + 1 + 1 .. sequence_pos + 1 + 1 + len].to_vec();
+                size_bin.reverse();     // big endian to little endian
+                size_bin.resize(8, 0x0);    // align to usize
+                usize::from_le_bytes(unsafe { *(size_bin.as_ptr() as *const [u8; 8]) })
+            } else {
+                // 短编码
+                header_len += 1;
+                cert_bin[sequence_pos + 1] as usize
+            };
+
+            Some(&cert_bin[sequence_pos.. sequence_pos + header_len + size])
+        },
+        None => None
+    }
+}
+```
+
+现在可以直接使用项目中的 pe-sign 工具的 `--embed` 参数直接导出：
+
+```powershell
+pe-sign extract <input_file> --pem --embed > pkcs7.pem
+```
+
+也可以直接传递到 openssl 解析：
+
+```powershell
+pe-sign extract <input_file> --pem --embed | openssl pkcs7 -inform pem -noout -text -print_certs
 ```
