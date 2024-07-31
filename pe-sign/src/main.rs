@@ -9,7 +9,7 @@ use pretty_hex::pretty_hex_write;
 
 const EMBEDDED_SIGNATURE_OID: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x04, 0x01];  // 1.3.6.1.4.1.311.2.4.1  szOID_NESTED_SIGNATURE
 
-fn extract_pkcs7_from_pe(file: &PathBuf) -> Result<Vec<u8>, Box<dyn Error>> {
+fn extract_pkcs7_from_pe(file: &PathBuf) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
     // 判断文件是否存在
     if !file.exists() {
         return Err(std::io::Error::new(
@@ -23,13 +23,19 @@ fn extract_pkcs7_from_pe(file: &PathBuf) -> Result<Vec<u8>, Box<dyn Error>> {
     let image = VecPE::from_disk_file(file.to_str().unwrap())?;
     let security_directory =
         image.get_data_directory(exe::ImageDirectoryEntry::Security)?;
+
+    // va = 0 表示无签名
+    if security_directory.virtual_address.0 == 0x00 {
+        return Ok(None);
+    }
+
     let signature_data =
         exe::Buffer::offset_to_ptr(&image, security_directory.virtual_address.into())?; // security_data_directory rva is equivalent to file offset
 
-    Ok(unsafe {
+    Ok(Some(unsafe {
         let vec = std::slice::from_raw_parts(signature_data, security_directory.size as usize).to_vec();    // cloned
         vec.into_iter().skip(8).collect()   // _WIN_CERTIFICATE->bCertificate
-    })
+    }))
 }
 
 fn extract_pkcs7_embedded<'a>(cert_bin: &'a [u8]) -> Option<&'a [u8]> {
@@ -104,9 +110,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut extracted_bin: Vec<u8> = vec![];
 
             // 从文件解析 pkcs7 签名数据
-            let mut pkcs7_bin = extract_pkcs7_from_pe(file)?;
+            let mut pkcs7_bin = extract_pkcs7_from_pe(file)?.expect("unsigned pe file.");
             if embedded {
-                pkcs7_bin = extract_pkcs7_embedded(&pkcs7_bin).expect("non embedded certificate.").to_vec();
+                pkcs7_bin = extract_pkcs7_embedded(&pkcs7_bin).expect("no embedded certificate.").to_vec();
             }
 
             if pem {
@@ -142,7 +148,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let file = sub_matches.get_one::<PathBuf>("FILE").unwrap();
 
             // 解析 PE 文件，获取签名数据
-            let pkcs7_bin = extract_pkcs7_from_pe(file)?;
+            let pkcs7_bin = extract_pkcs7_from_pe(file)?.expect("unsigned pe file.");
 
             // 解析 pkcs7
             let pkcs7 = Pkcs7::from_der(&pkcs7_bin)?;
