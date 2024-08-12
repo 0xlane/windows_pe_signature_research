@@ -6,9 +6,12 @@ use std::{
 };
 
 use exe::{self, VecPE, PE};
+use foreign_types::{ForeignType, ForeignTypeRef};
 use openssl::{
+    asn1::Asn1StringRef,
     pkcs7::{Pkcs7, Pkcs7Flags},
     stack::Stack,
+    x509::{store::X509StoreBuilder, verify::X509VerifyFlags, X509PurposeRef, X509},
 };
 use pretty_hex::pretty_hex_write;
 
@@ -162,8 +165,47 @@ fn main() -> Result<(), Box<dyn Error>> {
             // 解析 pkcs7
             let pkcs7 = Pkcs7::from_der(&pkcs7_bin)?;
 
-            // 打印签名者信息
+            // 加载 cacert
+            let cacert_bin = std::fs::read(".\\cacert.pem")?;
+            let mut store_builder = X509StoreBuilder::new()?;
+            let ca_certs = X509::stack_from_pem(&cacert_bin)?;
+            for ca_cert in ca_certs {
+                store_builder.add_cert(ca_cert)?;
+            }
+            let purpose_idx = X509PurposeRef::get_by_sname("any")?;
+            let x509_purposeref = X509PurposeRef::from_idx(purpose_idx)?;
+            store_builder.set_purpose(x509_purposeref.purpose())?;
+            store_builder.set_flags(X509VerifyFlags::NO_CHECK_TIME)?;
+            let store = store_builder.build();
+
+            // 从 signedData 提取 indata
+            let indata = unsafe {
+                let x = pkcs7.as_ptr();
+                let signed_data = (*x).d.sign;
+                let other = (*(*signed_data).contents).d.other;
+                let authenticode_seq = Asn1StringRef::from_ptr((*other).value.sequence).as_slice();
+
+                // seq -> seq
+                if authenticode_seq[1] >= 0b10000000 {
+                    // 长编码
+                    let len = (authenticode_seq[1] & 0b01111111) as usize;
+                    authenticode_seq[1 + 1 + len..].to_vec()
+                } else {
+                    // 短编码
+                    authenticode_seq[1 + 1..].to_vec()
+                }
+            };
+
             let mut empty_certs = Stack::new().unwrap();
+            pkcs7.verify(
+                &empty_certs,
+                &store,
+                Some(&indata),
+                None,
+                Pkcs7Flags::empty(),
+            )?;
+
+            // 打印签名者信息
             let signer_certs = pkcs7
                 .signers(
                     &mut empty_certs,

@@ -1588,3 +1588,79 @@ pe-sign extract <input_file> --pem --embed > pkcs7.pem
 ```powershell
 pe-sign extract <input_file> --pem --embed | openssl pkcs7 -inform pem -noout -text -print_certs
 ```
+
+## 验证证书
+
+PKCS #7 证书的验证可以直接调用 [`PKCS7_verify`](https://docs.openssl.org/1.0.2/man3/PKCS7_verify/)，该函数原型：
+
+```c++
+int PKCS7_verify(PKCS7 *p7, STACK_OF(X509) *certs, X509_STORE *store, BIO *indata, BIO *out, int flags);
+```
+
+根据参数可以知道验证证书需要准备的东西：
+
+- `p7`: 证书内容
+- `certs`: 可选参数，签名者证书，在 PE 提取的证书里一般有签名者，可以不传
+- `store`: 可选参数，用于链路验证的受信任证书存储，需要验证证书链所有证书的有效性，所以需要传，可以导入 curl 提供的 [cacert.pem](https://curl.se/docs/caextract.html) 文件作为受信任的 CA 证书
+- `indata`: 被签名的原始数据内容，可空
+- `out`: 验证通过后，输出签名的数据，可空
+- `flags`: 一些控制验证过程的标志，没有特殊需求就是 0
+
+里面比较特殊的是 `indata` 参数，根据资料显示如果证书为 detached 证书，即签名独立证书，此时证书内不包含被签名的原始数据内容，需要调用 `PKCS7_verify` 时传入 `indata` 参数，否则可以为空。
+
+这样的话，PE 中提取的证书内必然包含被签名的原始数据，所以看似不需要传入 `indata`，使用这个函数对应的 openssl 命令快速验证一下：
+
+```powershell
+PS C:\dev\windows_pe_signature_research>.\pe-sign.exe extract .\ProcessHacker.exe --pem | openssl smime -verify -inform PEM -CAfile .\cacert.pem -purpose any --no_check_time
+Verification failure
+64390000:error:80000002:system library:file_open:No such file or directory:providers\implementations\storemgmt\file_store.c:263:calling stat(C:\Program Files\Common Files\SSL/certs)
+64390000:error:1608010C:STORE routines:inner_loader_fetch:unsupported:crypto\store\store_meth.c:360:No store loader found. For standard store loaders you need at least one of the default or base providers available. Did you forget to load them? Info: Global default library context, Scheme (C : 0), Properties (<null>)
+64390000:error:10800065:PKCS7 routines:PKCS7_signatureVerify:digest failure:crypto\pkcs7\pk7_doit.c:1084:
+64390000:error:10800069:PKCS7 routines:PKCS7_verify:signature failure:crypto\pkcs7\pk7_smime.c:342:
+```
+
+验证失败了，导致失败的报错信息是 `digest failure` 和 `signature failure`，看起来是签名和原始数据内容并不匹配。大概查了一下，PKCS #7 SignedData 结构用 ASN.1 描述为：
+
+```asn.1
+SignedData ::= SEQUENCE {
+  version Version,
+  digestAlgorithms DigestAlgorithmIdentifiers,
+  contentInfo ContentInfo,
+  certificates [0] IMPLICIT ExtendedCertificatesAndCertificates OPTIONAL,
+  Crls [1] IMPLICIT CertificateRevocationLists OPTIONAL,
+  signerInfos SignerInfos
+}
+
+DigestAlgorithmIdentifiers ::=
+  SET OF DigestAlgorithmIdentifier
+
+ContentInfo ::= SEQUENCE {
+  contentType ContentType,
+  content [0] EXPLICIT ANY DEFINED BY contentType OPTIONAL
+}
+
+ContentType ::= OBJECT IDENTIFIER
+
+SignerInfos ::= SET OF SignerInfo
+
+SignerInfo ::= SEQUENCE {
+  version Version,
+  issuerAndSerialNumber IssuerAndSerialNumber,
+  digestAlgorithm DigestAlgorithmIdentifier,
+  authenticatedAttributes [0] IMPLICIT Attributes OPTIONAL,
+  digestEncryptionAlgorithm DigestEncryptionAlgorithmIdentifier,
+  encryptedDigest EncryptedDigest,
+  unauthenticatedAttributes [1] IMPLICIT Attributes OPTIONAL
+}
+IssuerAndSerialNumber ::= SEQUENCE {
+  issuer Name,
+  serialNumber CertificateSerialNumber
+}
+EncryptedDigest ::= OCTET STRING
+```
+
+`ContentInfo` 中保存的原始数据，`encryptedDigest` 中是消息摘要，验签时需要使用签名者的 publickey 解开 `encryptedDigest` 得到一个 hash，然后如果存在 `authenticatedAttributes`，里面能再提取出一个消息摘要，这个消息摘要的 hash 如果和 `encryptedDigest` 中的一致说明可信，验证 `authenticatedAttributes` 可信后，从 `authenticatedAttributes` 中又可以得到一个 hash，这个 hash 是 `ContentInfo` 中原始内容的 hash，最终通过该 hash 验证原始数据内容是否可信。假如没有 `authenticatedAttributes`，`encryptedDigest` 的消息摘要 hash 就是 `ContentInfor` 原始内容的 hash。
+
+调用 `PKCS7_verify` 时，会自动进行上面的验证，但是当解析 `ContentInfo->content` 的时候，根据 `ContentInfo->contentType` 类型解析，只有类型为 `data`、`ASN1_OCTET_STRING` 才能被正确解析到 content（参考源码位置 [pk7_doit.c#L48](https://github.com/openssl/openssl/blob/f98e49b326fe1fda5efadc10e7905b09a394591c/crypto/pkcs7/pk7_doit.c#L48)）。
+
+根据 [Authenticode_PE.docx](http://download.microsoft.com/download/9/c/5/9c5b2167-8017-4bae-9fde-d599bac8184a/Authenticode_PE.docx) 中的描述，Authenticode 相当于 PE 文件的 hash，保存在 `ContentInfo->content` 中，`ContentInfo->contentType` 必须是 `SPC_INDIRECT_DATA_OBJID (1.3.6.1.4.1.311.2.1.4)`，所以 `PKCS7_verify` 并不能解析出 content 内容，需要自行解析后通过 `indata` 参数传入。
