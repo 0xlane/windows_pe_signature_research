@@ -1664,3 +1664,227 @@ EncryptedDigest ::= OCTET STRING
 调用 `PKCS7_verify` 时，会自动进行上面的验证，但是当解析 `ContentInfo->content` 的时候，根据 `ContentInfo->contentType` 类型解析，只有类型为 `data`、`ASN1_OCTET_STRING` 才能被正确解析到 content（参考源码位置 [pk7_doit.c#L48](https://github.com/openssl/openssl/blob/f98e49b326fe1fda5efadc10e7905b09a394591c/crypto/pkcs7/pk7_doit.c#L48)）。
 
 根据 [Authenticode_PE.docx](http://download.microsoft.com/download/9/c/5/9c5b2167-8017-4bae-9fde-d599bac8184a/Authenticode_PE.docx) 中的描述，Authenticode 相当于 PE 文件的 hash，保存在 `ContentInfo->content` 中，`ContentInfo->contentType` 必须是 `SPC_INDIRECT_DATA_OBJID (1.3.6.1.4.1.311.2.1.4)`，所以 `PKCS7_verify` 并不能解析出 content 内容，需要自行解析后通过 `indata` 参数传入。
+
+以下是 `SpcIndirectDataContent` 的 ASN.1 定义：
+
+```asn.1
+SpcIndirectDataContent ::= SEQUENCE {
+    data                    SpcAttributeTypeAndOptionalValue,
+    messageDigest           DigestInfo
+} --#public—
+
+SpcAttributeTypeAndOptionalValue ::= SEQUENCE {
+    type                    ObjectID,
+    value                   [0] EXPLICIT ANY OPTIONAL
+}
+
+DigestInfo ::= SEQUENCE {
+    digestAlgorithm     AlgorithmIdentifier,
+    digest              OCTETSTRING
+}
+
+AlgorithmIdentifier    ::=    SEQUENCE {
+    algorithm           ObjectID,
+    parameters          [0] EXPLICIT ANY OPTIONAL
+}
+```
+
+对应的 asn1parse 解析结果：
+
+```powershell
+39:d=3  hl=2 l=  76 cons:    SEQUENCE          
+41:d=4  hl=2 l=  10 prim:     OBJECT            :1.3.6.1.4.1.311.2.1.4                          // contentType = SPC_INDIRECT_DATA_OBJID
+53:d=4  hl=2 l=  62 cons:     cont [ 0 ]        
+55:d=5  hl=2 l=  60 cons:      SEQUENCE                                                         // SpcIndirectDataContent
+57:d=6  hl=2 l=  23 cons:       SEQUENCE          
+59:d=7  hl=2 l=  10 prim:        OBJECT            :1.3.6.1.4.1.311.2.1.15
+71:d=7  hl=2 l=   9 cons:        SEQUENCE          
+73:d=8  hl=2 l=   1 prim:         BIT STRING        
+76:d=8  hl=2 l=   4 cons:         cont [ 0 ]        
+78:d=9  hl=2 l=   2 cons:          cont [ 2 ]        
+80:d=10 hl=2 l=   0 prim:           cont [ 0 ]        
+82:d=6  hl=2 l=  33 cons:       SEQUENCE          
+84:d=7  hl=2 l=   9 cons:        SEQUENCE          
+86:d=8  hl=2 l=   5 prim:         OBJECT            :sha1
+93:d=8  hl=2 l=   0 prim:         NULL              
+95:d=7  hl=2 l=  20 prim:        OCTET STRING      [HEX DUMP]:9253A6F72EE0E3970D5457E0F061FDB40B484F18
+```
+
+下面是 pe-sign 工具中关于提取 `indata` 的代码：
+
+```rust
+let indata = unsafe {
+    let x = pkcs7.as_ptr();
+    let signed_data = (*x).d.sign;
+    let other = (*(*signed_data).contents).d.other;
+    let authenticode_seq =
+        Asn1StringRef::from_ptr((*other).value.sequence).as_slice();
+
+    // seq value
+    if authenticode_seq[1] >= 0b10000000 {
+        // 长编码
+        let len = (authenticode_seq[1] & 0b01111111) as usize;
+        authenticode_seq[1 + 1 + len..].to_vec()
+    } else {
+        // 短编码
+        authenticode_seq[1 + 1..].to_vec()
+    }
+};
+```
+
+## 解析证书中的一些关键信息
+
+由于 openssl 解析出的证书信息只是一些证书通用的信息，有些关键字段还需要单独解析一下：
+
+- signingTime: 签名时间
+- authenticode: PE 部分内容的哈希，验证证书有效之后，还需要验证 authenticode
+
+### 签名时间解析
+
+签名时间大多数时候存储在副署签名里，少数直接在认证属性里就可以找到，在副署签名里的时候有两种情况：
+
+第一种情况，当 unauth_attrs 直接存在副署（countersignature）属性时，该内容为 `PKCS7_SIGNER_INFO` 结构，表示副署签名者信息，该信息作为副署（countersignature）签名展示：
+
+![countersignature_unauth_attr](./assets/countersignature_unauth_attr.png)
+
+第二种情况，不存在副署（countersignature）属性，寻找 unauth_attrs 中的 `1.3.6.1.4.1.311.3.3.1` 属性作为副署签名，该内容为 Timestamping signature：
+
+![ts_signature_attr](./assets/ts_signature_attr.png)
+
+该属性内容被作为副署（countersignature）签名展示：
+
+![countersignature](./assets/countersignature.png)
+
+签名时间一般保存在副署签名中名为 signingTime 的 auth_attrs 里：
+
+![signing_time_auth_attr](./assets/signing_time_auth_attr.png)
+
+如果 signingTime 属性不存在（[案例](https://s.threatbook.com/report/file/3177a0554250e2092443b00057f3919efd6d544e243444b70eb30f1f7dd9f1d1)），签名时间保存在 `contentInfo->content` 中。
+
+把案例文件的 `1.3.6.1.4.1.311.3.3.1` 属性内容导出：
+
+```powershell
+pe-sign.exe extract 3177a0554250e2092443b00057f3919efd6d544e243444b70eb30f1f7dd9f1d1 -o ts331_sign.cer
+$offset = 4243
+$size = 6016
+$fileStream = [System.IO.File]::OpenRead(".\ts331_sign.cer")
+$buffer = New-Object byte[] $size
+$fileStream.Seek($offset, [System.IO.SeekOrigin]::Begin)
+$fileStream.Read($buffer, 0, $size)
+$fileStream.Close()
+[System.IO.File]::WriteAllBytes(".\ts331_attr.cer", $buffer)
+openssl cms -cmsout -inform DER -in .\ts331_attr.cer -text -noout -print
+```
+
+从结果中可以看到，`contentInfo->content` 内容类型为 `id-smime-ct-TSTInfo`，里面也是一段 ASN.1 序列化数据：
+
+```powershell
+CMS_ContentInfo:
+  contentType: pkcs7-signedData (1.2.840.113549.1.7.2)
+  d.signedData:
+    version: 3
+    digestAlgorithms:
+        algorithm: sha256 (2.16.840.1.101.3.4.2.1)
+        parameter: NULL
+    encapContentInfo:
+      eContentType: id-smime-ct-TSTInfo (1.2.840.113549.1.9.16.1.4)
+      eContent:
+        0000 - 30 82 01 39 02 01 01 06-0a 2b 06 01 04 01 84   0..9.....+.....
+        000f - 59 0a 03 01 30 31 30 0d-06 09 60 86 48 01 65   Y...010...`.H.e
+        001e - 03 04 02 01 05 00 04 20-fb e4 fd ce 67 6d c5   ....... ....gm.
+        002d - 75 54 88 67 d0 48 b6 04-b4 e4 33 2d c2 1c 89   uT.g.H....3-...
+        003c - 0a 70 80 cc 1e 28 a6 a2-f7 25 02 06 66 95 56   .p...(...%..f.V
+        004b - 6e bc 39 18 13 32 30 32-34 30 38 30 31 30 30   n.9..2024080100
+        005a - 34 36 34 34 2e 36 31 37-5a 30 04 80 02 01 f4   4644.617Z0.....
+        0069 - a0 81 d1 a4 81 ce 30 81-cb 31 0b 30 09 06 03   ......0..1.0...
+        0078 - 55 04 06 13 02 55 53 31-13 30 11 06 03 55 04   U....US1.0...U.
+        0087 - 08 13 0a 57 61 73 68 69-6e 67 74 6f 6e 31 10   ...Washington1.
+        0096 - 30 0e 06 03 55 04 07 13-07 52 65 64 6d 6f 6e   0...U....Redmon
+        00a5 - 64 31 1e 30 1c 06 03 55-04 0a 13 15 4d 69 63   d1.0...U....Mic
+        00b4 - 72 6f 73 6f 66 74 20 43-6f 72 70 6f 72 61 74   rosoft Corporat
+        00c3 - 69 6f 6e 31 25 30 23 06-03 55 04 0b 13 1c 4d   ion1%0#..U....M
+        00d2 - 69 63 72 6f 73 6f 66 74-20 41 6d 65 72 69 63   icrosoft Americ
+        00e1 - 61 20 4f 70 65 72 61 74-69 6f 6e 73 31 27 30   a Operations1'0
+        00f0 - 25 06 03 55 04 0b 13 1e-6e 53 68 69 65 6c 64   %..U....nShield
+        00ff - 20 54 53 53 20 45 53 4e-3a 41 34 30 30 2d 30    TSS ESN:A400-0
+        010e - 35 45 30 2d 44 39 34 37-31 25 30 23 06 03 55   5E0-D9471%0#..U
+        011d - 04 03 13 1c 4d 69 63 72-6f 73 6f 66 74 20 54   ....Microsoft T
+        012c - 69 6d 65 2d 53 74 61 6d-70 20 53 65 72 76 69   ime-Stamp Servi
+        013b - 63 65                                          ce
+```
+
+从右侧可以看出，`20240801004644.617Z` 就是签名时间。程序中需要解析 TSTInfo 结构：
+
+```asn.1
+TSTInfo ::= SEQUENCE {
+    version        INTEGER { v1(1) },
+    policy         TSAPolicyID,
+    messageImprint MessageImprint,
+        -- MUST have the same value as the similar field in
+        -- TimeStampReq serialNumber INTEGER,
+        -- Time Stamps users MUST be ready to accommodate integers
+        -- up to 160 bits.
+    genTime        GeneralizedTime,
+    accuracy       Accuracy     OPTIONAL,
+    ordering       BOOLEAN DEFAULT FALSE,
+    nonce          INTEGER      OPTIONAL,
+        -- MUST be present if the similar field was present
+        -- in TimeStampReq. In that case it MUST have the same value.
+    tsa [0]        GeneralName  OPTIONAL,
+    extensions [1] IMPLICIT Extensions OPTIONAL
+}
+```
+
+提取出 `contentInfo->content`，并通过 openssl 解析 asn1 结构：
+
+```powershell
+PS C:\dev\windows_pe_signature_research> openssl cms -verify -inform DER -in .\ts331_attr.cer -noverify -out content.bin -binary
+PS C:\dev\windows_pe_signature_research> openssl asn1parse -i -inform DER -in .\content.bin
+    0:d=0  hl=4 l= 313 cons: SEQUENCE
+    4:d=1  hl=2 l=   1 prim:  INTEGER           :01
+    7:d=1  hl=2 l=  10 prim:  OBJECT            :1.3.6.1.4.1.601.10.3.1
+   19:d=1  hl=2 l=  49 cons:  SEQUENCE
+   21:d=2  hl=2 l=  13 cons:   SEQUENCE
+   23:d=3  hl=2 l=   9 prim:    OBJECT            :sha256
+   34:d=3  hl=2 l=   0 prim:    NULL
+   36:d=2  hl=2 l=  32 prim:   OCTET STRING      [HEX DUMP]:FBE4FDCE676DC575548867D048B604B4E4332DC21C890A7080CC1E28A6A2F725
+   70:d=1  hl=2 l=   6 prim:  INTEGER           :6695566EBC39
+   78:d=1  hl=2 l=  19 prim:  GENERALIZEDTIME   :20240801004644.617Z
+   99:d=1  hl=2 l=   4 cons:  SEQUENCE
+  101:d=2  hl=2 l=   2 prim:   cont [ 0 ]
+  105:d=1  hl=3 l= 209 cons:  cont [ 0 ]
+  108:d=2  hl=3 l= 206 cons:   cont [ 4 ]
+  111:d=3  hl=3 l= 203 cons:    SEQUENCE
+  114:d=4  hl=2 l=  11 cons:     SET
+  116:d=5  hl=2 l=   9 cons:      SEQUENCE
+  118:d=6  hl=2 l=   3 prim:       OBJECT            :countryName
+  123:d=6  hl=2 l=   2 prim:       PRINTABLESTRING   :US
+  127:d=4  hl=2 l=  19 cons:     SET
+  129:d=5  hl=2 l=  17 cons:      SEQUENCE
+  131:d=6  hl=2 l=   3 prim:       OBJECT            :stateOrProvinceName
+  136:d=6  hl=2 l=  10 prim:       PRINTABLESTRING   :Washington
+  148:d=4  hl=2 l=  16 cons:     SET
+  150:d=5  hl=2 l=  14 cons:      SEQUENCE
+  152:d=6  hl=2 l=   3 prim:       OBJECT            :localityName
+  157:d=6  hl=2 l=   7 prim:       PRINTABLESTRING   :Redmond
+  166:d=4  hl=2 l=  30 cons:     SET
+  168:d=5  hl=2 l=  28 cons:      SEQUENCE
+  170:d=6  hl=2 l=   3 prim:       OBJECT            :organizationName
+  175:d=6  hl=2 l=  21 prim:       PRINTABLESTRING   :Microsoft Corporation
+  198:d=4  hl=2 l=  37 cons:     SET
+  200:d=5  hl=2 l=  35 cons:      SEQUENCE
+  202:d=6  hl=2 l=   3 prim:       OBJECT            :organizationalUnitName
+  207:d=6  hl=2 l=  28 prim:       PRINTABLESTRING   :Microsoft America Operations
+  237:d=4  hl=2 l=  39 cons:     SET
+  239:d=5  hl=2 l=  37 cons:      SEQUENCE
+  241:d=6  hl=2 l=   3 prim:       OBJECT            :organizationalUnitName
+  246:d=6  hl=2 l=  30 prim:       PRINTABLESTRING   :nShield TSS ESN:A400-05E0-D947
+  278:d=4  hl=2 l=  37 cons:     SET
+  280:d=5  hl=2 l=  35 cons:      SEQUENCE
+  282:d=6  hl=2 l=   3 prim:       OBJECT            :commonName
+  287:d=6  hl=2 l=  28 prim:       PRINTABLESTRING   :Microsoft Time-Stamp Service
+```
+
+没有找到能快速解析 TSTInfo 结构的方法，所以代码里直接通过搜索第一个 `GENERALIZEDTIME` 作为签名时间。在 ASN.1 序列化数据中 0x18 表示 `GENERALIZEDTIME`，后跟一个字节表示长度，因为 `GENERALIZEDTIME` 时间格式大多数时候为 `YYYYMMDDHHMMSSZ`、`YYYYMMDDHHMMSS.sssZ`，其他情况遇到再改代码吧，`s` 可以减少不一定是 3 个，所以长度在 15 - 19 这个范围，找 `18 [15, 19]` 序列即可。
+
+### authenticode 解析

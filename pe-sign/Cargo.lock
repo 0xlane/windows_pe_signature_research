@@ -367,6 +367,7 @@ dependencies = [
 name = "pe-sign"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "exe",
  "foreign-types",
