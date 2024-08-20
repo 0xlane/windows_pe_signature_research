@@ -1965,3 +1965,65 @@ fn extract_authtiencode(cert_bin: &[u8]) -> Option<(String, String)> {
     None
 }
 ```
+
+通过 pe-sign 工具验证证书并打印证书信息：
+
+```powershell
+pe-sign verify <input_file>
+```
+
+## authenticode 计算
+
+[Authenticode_PE.docx](http://download.microsoft.com/download/9/c/5/9c5b2167-8017-4bae-9fde-d599bac8184a/Authenticode_PE.docx) 中有详细的 authenticode 计算步骤：
+
+1. 加载 PE 文件到内存
+2. 初始化 hash 算法上下文
+3. hash checknum 字段之前的内容
+4. 跳过 checknum 字段，4 字节
+5. hash checknum 字段之后到 Certificate Table Directory 之前
+6. 获取 Certificate Table Directory 大小
+7. 跳过 Certificate Table Directory，hash Certificate Table Directory 之后到 header 结尾
+8. 创建一个计数器 SUM_OF_BYTES_HASHED, 设置计数器为 optionalHeader->SizeOfHeaders 字段值
+9. 构建一个由 section header 组成的数组
+10. 根据 PointerToRawData 字段对 section header 数组递增排序
+11. 根据排序后的 section header，hash section 内容
+12. 添加 section header 的 SizeOfRawData 值到 SUM_OF_BYTES_HASHED
+13. 重复 11、12 步遍历所有 section
+14. 创建一个 FILE_SIZE 变量表示文件大小，如果 FILE_SIZE 比 SUM_OF_BYTES_HASHED 大，表示还有额外的数据需要 hash. 额外数据在 SUM_OF_BYTES_HASHED 偏移处开始，长度为：
+(File Size) – ((Size of AttributeCertificateTable) + SUM_OF_BYTES_HASHED)
+15. 完成 hash 算法上下文
+
+可以通过 pe-sign 工具计算 authenticode，支持 sha1、sha256、md5 三种算法：
+
+```powershell
+PS C:\dev\windows_pe_signature_research> pe-sign help calc
+Calculate the authticode digest of a PE file
+
+Usage: pe-sign.exe calc [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>
+
+Options:
+  -a, --algorithm <ALGORITHM>  Hash algorithm [default: sha256] [possible values: sha1, sha256, md5]
+  -h, --help                   Print help
+```
+
+使用 pe-sign 工具验证文件签名时，status 如果是 `InvalidSignature` 表示证书中的 authenticode 与实际不符，文件被篡改：
+
+```powershell
+PS C:\dev\windows_pe_signature_research> pe-sign verify .\3177a0554250e2092443b00057f3919efd6d544e243444b70eb30f1f7dd9f1d1"
+Certificate:
+    CN: Microsoft Corporation
+    Status: InvalidSignature
+    Version: V2
+    SN: 33000003af30400e4ca34d05410000000003af
+    Fingerprint: c2048fb509f1c37a8c3e9ec6648118458aa01780
+    Algorithm: sha256WithRSAEncryption
+    ValidityPeriod: 2023-11-17 03:09:00 +08:00 - 2024-11-15 03:09:00 +08:00
+    SigningTime: 2024-08-01 08:46:44.617 +08:00
+    Authenticode: 60d5dabe345c33681964cc0ae9f4bfebc754869f4d0c918d12f9c5ecce26296c
+==============================================================
+PS C:\dev\windows_pe_signature_research> pe-sign calc .\3177a0554250e2092443b00057f3919efd6d544e243444b70eb30f1f7dd9f1d1"
+ab19518250c085de397e582c33f4bb911a193ac500aa7952d318faae41a477c0
+```

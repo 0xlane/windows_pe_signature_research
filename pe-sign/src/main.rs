@@ -4,17 +4,19 @@ use std::{
     fmt::Display,
     fs::File,
     io::{BufWriter, IsTerminal, Write},
+    mem,
+    ops::Range,
     path::PathBuf,
     ptr::null_mut,
 };
 
 use chrono::{Local, NaiveDateTime};
-use exe::{self, VecPE, PE};
+use exe::{Buffer, ImageDataDirectory, ImageDirectoryEntry, NTHeaders, VecPE, PE};
 use foreign_types::{ForeignType, ForeignTypeRef};
 use openssl::{
     asn1::{Asn1ObjectRef, Asn1OctetStringRef, Asn1StringRef, Asn1TimeRef},
     cms::{CMSOptions, CmsContentInfo},
-    hash::MessageDigest,
+    hash::{Hasher, MessageDigest},
     nid::Nid,
     pkcs7::{Pkcs7, Pkcs7Flags, Pkcs7SignerInfo},
     stack::{Stack, StackRef},
@@ -43,15 +45,14 @@ fn extract_pkcs7_from_pe(file: &PathBuf) -> Result<Option<Vec<u8>>, Box<dyn Erro
 
     // 解析 PE 文件，获取签名数据
     let image = VecPE::from_disk_file(file.to_str().unwrap())?;
-    let security_directory = image.get_data_directory(exe::ImageDirectoryEntry::Security)?;
+    let security_directory = image.get_data_directory(ImageDirectoryEntry::Security)?;
 
     // va = 0 表示无签名
     if security_directory.virtual_address.0 == 0x00 {
         return Ok(None);
     }
 
-    let signature_data =
-        exe::Buffer::offset_to_ptr(&image, security_directory.virtual_address.into())?; // security_data_directory rva is equivalent to file offset
+    let signature_data = Buffer::offset_to_ptr(&image, security_directory.virtual_address.into())?; // security_data_directory rva is equivalent to file offset
 
     Ok(Some(unsafe {
         let vec =
@@ -178,6 +179,80 @@ fn extract_authtiencode(cert_bin: &[u8]) -> Option<(String, String)> {
     None
 }
 
+fn calc_authenticode(file: &PathBuf, algorithm: &str) -> Result<String, Box<dyn Error>> {
+    let image = VecPE::from_disk_file(file.to_str().unwrap())?;
+    let mut hasher = match algorithm {
+        "sha1" => Hasher::new(MessageDigest::sha1())?,
+        "sha256" => Hasher::new(MessageDigest::sha256())?,
+        "md5" => Hasher::new(MessageDigest::md5())?,
+        _ => unreachable!("only 3 values"),
+    };
+
+    // SizeOfHeaders > dosHeader + ntHeader + dataDirectory + sectionTable
+    let (checknum_ref, size_of_headers) = match image.get_valid_nt_headers() {
+        Ok(h) => match h {
+            NTHeaders::NTHeaders32(h32) => (
+                &h32.optional_header.checksum,
+                h32.optional_header.size_of_headers as usize,
+            ),
+            NTHeaders::NTHeaders64(h64) => (
+                &h64.optional_header.checksum,
+                h64.optional_header.size_of_headers as usize,
+            ),
+        },
+        Err(e) => return Err(Box::new(e)),
+    };
+    let checknum_offset = image.ref_to_offset(checknum_ref)?;
+    let before_checknum_offset = checknum_offset;
+    let after_checknum_offset = checknum_offset
+        .checked_add(mem::size_of::<u32>())
+        .ok_or("overflow")?;
+    let sec_directory_ref = image.get_data_directory(ImageDirectoryEntry::Security)?;
+    let sec_directory_offset = image.ref_to_offset(sec_directory_ref)?;
+    let before_sec_directory_offset = sec_directory_offset;
+    let after_sec_directory_offset = sec_directory_offset
+        .checked_add(mem::size_of::<ImageDataDirectory>())
+        .ok_or("overflow")?;
+    let header_end_offset = size_of_headers;
+    let file_size = image.len();
+    let mut num_of_bytes_hashed: usize;
+
+    hasher.update(&image[..before_checknum_offset])?;
+    hasher.update(&image[after_checknum_offset..before_sec_directory_offset])?;
+    hasher.update(&image[after_sec_directory_offset..header_end_offset])?;
+    num_of_bytes_hashed = header_end_offset;
+
+    // 排序 section 后 hash
+    let mut section_ranges = image
+        .get_section_table()?
+        .iter()
+        .map(|v| {
+            v.pointer_to_raw_data.0 as usize
+                ..v.pointer_to_raw_data.0 as usize + v.size_of_raw_data as usize
+        })
+        .collect::<Vec<Range<usize>>>();
+    section_ranges.sort_unstable_by_key(|v| v.start);
+
+    for section_range in section_ranges {
+        let section_data = &image[section_range];
+        hasher.update(section_data)?;
+        num_of_bytes_hashed += section_data.len();
+    }
+
+    // Security data size
+    let num_of_security_data = sec_directory_ref.size as usize;
+
+    // hash 额外内容
+    let extra_start = num_of_bytes_hashed;
+    let extra_size = file_size - num_of_security_data - num_of_bytes_hashed;
+    let extra_end = extra_start + extra_size;
+    hasher.update(&image[extra_start..extra_end])?;
+
+    let result = hasher.finish()?;
+
+    Ok(to_hex_str(&result))
+}
+
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 enum CertificateStatus {
@@ -237,6 +312,18 @@ fn cli() -> clap::Command {
                         .value_parser(value_parser!(PathBuf))
                         .required(true),
                     arg!(--"no-check-time" "Ignore certificate validity time"),
+                ]),
+        )
+        .subcommand(
+            Command::new("calc")
+                .about("Calculate the authticode digest of a PE file")
+                .args(&[
+                    arg!([FILE])
+                        .value_parser(value_parser!(PathBuf))
+                        .required(true),
+                    arg!(-a --algorithm <ALGORITHM> "Hash algorithm")
+                        .value_parser(["sha1", "sha256", "md5"])
+                        .default_value("sha256"),
                 ]),
         )
 }
@@ -339,7 +426,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 };
 
                 let mut empty_certs = Stack::new().unwrap();
-                let status = match pkcs7.verify(
+                let mut status = match pkcs7.verify(
                     &empty_certs,
                     &store,
                     Some(&indata),
@@ -552,7 +639,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
 
-                let (_, authenticode) = extract_authtiencode(&indata).unwrap();
+                let (authenticode_digest_algorithm, authenticode_digest) =
+                    extract_authtiencode(&indata).unwrap();
+                let authenticode = calc_authenticode(file, &authenticode_digest_algorithm)?;
+
+                if authenticode != authenticode_digest {
+                    status = CertificateStatus::InvalidSignature;
+                }
 
                 println!(
                     r"Certificate:
@@ -577,12 +670,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                     signing_time
                         .and_then(|t| Some(t.to_string()))
                         .unwrap_or("Unknown".to_owned()),
-                    authenticode
+                    authenticode_digest
                 );
             }
 
             Ok(())
-        }
+        },
+        Some(("calc", sub_matches)) => {
+            let file = sub_matches.get_one::<PathBuf>("FILE").unwrap();
+            let algorithm = sub_matches.get_one::<String>("algorithm").unwrap();
+
+            println!("{}", calc_authenticode(&file, algorithm)?);
+
+            Ok(())
+        },
         _ => unreachable!("subcommand_required is true"),
     }
 }
