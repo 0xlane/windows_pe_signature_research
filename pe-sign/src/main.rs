@@ -14,6 +14,7 @@ use foreign_types::{ForeignType, ForeignTypeRef};
 use openssl::{
     asn1::{Asn1ObjectRef, Asn1StringRef, Asn1TimeRef},
     cms::{CMSOptions, CmsContentInfo},
+    hash::MessageDigest,
     nid::Nid,
     pkcs7::{Pkcs7, Pkcs7Flags, Pkcs7SignerInfo},
     stack::{Stack, StackRef},
@@ -144,6 +145,18 @@ impl Display for CertificateStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self)
     }
+}
+
+fn to_hex_str<T>(bytes: &T) -> String
+where
+    T: AsRef<[u8]> + ?Sized,
+{
+    let x = bytes.as_ref();
+
+    x.iter()
+        .map(|v| format!("{:02x}", v))
+        .collect::<Vec<String>>()
+        .join("")
 }
 
 fn cli() -> clap::Command {
@@ -327,11 +340,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .unwrap();
                 let version = signer_cert.version();
                 let algorithm = signer_cert.signature_algorithm().object().to_string();
-                let sn = signer_cert
-                    .serial_number()
-                    .to_bn()
-                    .unwrap();
-                let sn = sn.to_vec().iter().map(|v| format!("{:02x}", v)).collect::<Vec<String>>().join(" ");
+                let sn = signer_cert.serial_number().to_bn().unwrap();
+                let sn = to_hex_str(&sn.to_vec());
+                let fingerprint = to_hex_str(&signer_cert.digest(MessageDigest::sha1())?);
                 let start_time = NaiveDateTime::parse_from_str(
                     &signer_cert.not_before().to_string(),
                     "%b %d %H:%M:%S %Y GMT",
@@ -346,6 +357,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .unwrap()
                 .and_utc()
                 .with_timezone(&Local);
+
                 let mut signing_time = None;
                 unsafe {
                     let signed = pkcs7.signed().unwrap().as_ptr().as_ref().unwrap();
@@ -496,6 +508,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 println!("Certificate status: {}", status);
                 println!("Certificate version: V{}", version);
                 println!("Certificate SN: {}", sn);
+                println!("Certificate fingerprint: {}", fingerprint);
                 println!("Certificate algorithm: {}", algorithm);
                 println!("Certificate validity period: {} - {}", start_time, end_time);
                 println!(
