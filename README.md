@@ -1888,3 +1888,80 @@ PS C:\dev\windows_pe_signature_research> openssl asn1parse -i -inform DER -in .\
 没有找到能快速解析 TSTInfo 结构的方法，所以代码里直接通过搜索第一个 `GENERALIZEDTIME` 作为签名时间。在 ASN.1 序列化数据中 0x18 表示 `GENERALIZEDTIME`，后跟一个字节表示长度，因为 `GENERALIZEDTIME` 时间格式大多数时候为 `YYYYMMDDHHMMSSZ`、`YYYYMMDDHHMMSS.sssZ`，其他情况遇到再改代码吧，`s` 可以减少不一定是 3 个，所以长度在 15 - 19 这个范围，找 `18 [15, 19]` 序列即可。
 
 ### authenticode 解析
+
+Authenticode 信息在 `indata` 里，需要根据 `SpcIndirectDataContent` 结构解析：
+
+```asn.1
+SpcIndirectDataContent ::= SEQUENCE {
+    data                    SpcAttributeTypeAndOptionalValue,
+    messageDigest           DigestInfo
+} --#public—
+
+SpcAttributeTypeAndOptionalValue ::= SEQUENCE {
+    type                    ObjectID,
+    value                   [0] EXPLICIT ANY OPTIONAL
+}
+
+DigestInfo ::= SEQUENCE {
+    digestAlgorithm     AlgorithmIdentifier,
+    digest              OCTETSTRING
+}
+
+AlgorithmIdentifier    ::=    SEQUENCE {
+    algorithm           ObjectID,
+    parameters          [0] EXPLICIT ANY OPTIONAL
+}
+```
+
+`SpcIndirectDataContent->messageDigest->digest` 就是 authenticode，indata 数据开头的 sequence 表示的是 `SpcIndirectDataContent->data`，跳过这个 sequence 就是 `messageDigest`。
+
+提取代码：
+
+```rust
+fn extract_authtiencode(cert_bin: &[u8]) -> Option<(String, String)> {
+    unsafe {
+        let asn1_type =
+            d2i_ASN1_TYPE(null_mut(), &mut cert_bin.as_ptr(), cert_bin.len() as _).as_ref()?;
+        if asn1_type.type_ == V_ASN1_SEQUENCE {
+            let data_seq = Asn1StringRef::from_ptr(asn1_type.value.sequence);
+            let data_len = data_seq.len();
+            if data_len > 0 && cert_bin.len() > data_len {
+                // 跳过 SpcIndirectDataContent->data 得到 SpcIndirectDataContent->messageDigest
+                let message_digest_bin = &cert_bin[data_len..];
+                // 跳过 seq header
+                let message_digest_bin = &message_digest_bin[2..];
+                // 解析 digestAlgorithm
+                let digest_algo_obj_bin_len = message_digest_bin[3] as usize;
+                let digest_algo_obj_bin = &message_digest_bin[2..2 + 2 + digest_algo_obj_bin_len];
+                let asn1_type = d2i_ASN1_TYPE(
+                    null_mut(),
+                    &mut digest_algo_obj_bin.as_ptr(),
+                    digest_algo_obj_bin.len() as _,
+                )
+                .as_ref()?;
+                if asn1_type.type_ == V_ASN1_OBJECT {
+                    let digest_algo_obj = Asn1ObjectRef::from_ptr(asn1_type.value.object);
+                    let digest_algo_str = digest_algo_obj.to_string();
+                    // 跳过 SpcIndirectDataContent->messageDigest->digestAlgorithm 得到 SpcIndirectDataContent->messageDigest -> digest
+                    let digest_algo_seq_len = message_digest_bin[1] as usize;
+                    let digest_octet_str_bin = &message_digest_bin[2 + digest_algo_seq_len..];
+                    let asn1_type = d2i_ASN1_TYPE(
+                        null_mut(),
+                        &mut digest_octet_str_bin.as_ptr(),
+                        digest_octet_str_bin.len() as _,
+                    )
+                    .as_ref()?;
+                    if asn1_type.type_ == V_ASN1_OCTET_STRING {
+                        let digest_octet_str =
+                            Asn1OctetStringRef::from_ptr(asn1_type.value.octet_string);
+                        let authenticode = to_hex_str(digest_octet_str.as_slice());
+                        return Some((digest_algo_str, authenticode));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+```

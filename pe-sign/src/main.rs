@@ -12,7 +12,7 @@ use chrono::{Local, NaiveDateTime};
 use exe::{self, VecPE, PE};
 use foreign_types::{ForeignType, ForeignTypeRef};
 use openssl::{
-    asn1::{Asn1ObjectRef, Asn1StringRef, Asn1TimeRef},
+    asn1::{Asn1ObjectRef, Asn1OctetStringRef, Asn1StringRef, Asn1TimeRef},
     cms::{CMSOptions, CmsContentInfo},
     hash::MessageDigest,
     nid::Nid,
@@ -21,9 +21,10 @@ use openssl::{
     x509::{store::X509StoreBuilder, verify::X509VerifyFlags, X509PurposeRef, X509},
 };
 use openssl_sys::{
-    NID_commonName, NID_pkcs9_countersignature, NID_pkcs9_signingTime, OPENSSL_sk_num,
-    OPENSSL_sk_value, PKCS7_get_signed_attribute, X509_ATTRIBUTE_get0_object,
-    X509_ATTRIBUTE_get0_type, PKCS7_SIGNER_INFO, V_ASN1_SEQUENCE, V_ASN1_UTCTIME,
+    d2i_ASN1_TYPE, NID_commonName, NID_pkcs9_countersignature, NID_pkcs9_signingTime,
+    OPENSSL_sk_num, OPENSSL_sk_value, PKCS7_get_signed_attribute, X509_ATTRIBUTE_get0_object,
+    X509_ATTRIBUTE_get0_type, PKCS7_SIGNER_INFO, V_ASN1_OBJECT, V_ASN1_OCTET_STRING,
+    V_ASN1_SEQUENCE, V_ASN1_UTCTIME,
 };
 use pretty_hex::pretty_hex_write;
 
@@ -128,6 +129,53 @@ extern "C" {
         pp: *mut *const u8,
         length: c_long,
     ) -> *mut PKCS7_SIGNER_INFO;
+}
+
+fn extract_authtiencode(cert_bin: &[u8]) -> Option<(String, String)> {
+    unsafe {
+        let asn1_type =
+            d2i_ASN1_TYPE(null_mut(), &mut cert_bin.as_ptr(), cert_bin.len() as _).as_ref()?;
+        if asn1_type.type_ == V_ASN1_SEQUENCE {
+            let data_seq = Asn1StringRef::from_ptr(asn1_type.value.sequence);
+            let data_len = data_seq.len();
+            if data_len > 0 && cert_bin.len() > data_len {
+                // 跳过 SpcIndirectDataContent->data 得到 SpcIndirectDataContent->messageDigest
+                let message_digest_bin = &cert_bin[data_len..];
+                // 跳过 seq header
+                let message_digest_bin = &message_digest_bin[2..];
+                // 解析 digestAlgorithm
+                let digest_algo_obj_bin_len = message_digest_bin[3] as usize;
+                let digest_algo_obj_bin = &message_digest_bin[2..2 + 2 + digest_algo_obj_bin_len];
+                let asn1_type = d2i_ASN1_TYPE(
+                    null_mut(),
+                    &mut digest_algo_obj_bin.as_ptr(),
+                    digest_algo_obj_bin.len() as _,
+                )
+                .as_ref()?;
+                if asn1_type.type_ == V_ASN1_OBJECT {
+                    let digest_algo_obj = Asn1ObjectRef::from_ptr(asn1_type.value.object);
+                    let digest_algo_str = digest_algo_obj.to_string();
+                    // 跳过 SpcIndirectDataContent->messageDigest->digestAlgorithm 得到 SpcIndirectDataContent->messageDigest -> digest
+                    let digest_algo_seq_len = message_digest_bin[1] as usize;
+                    let digest_octet_str_bin = &message_digest_bin[2 + digest_algo_seq_len..];
+                    let asn1_type = d2i_ASN1_TYPE(
+                        null_mut(),
+                        &mut digest_octet_str_bin.as_ptr(),
+                        digest_octet_str_bin.len() as _,
+                    )
+                    .as_ref()?;
+                    if asn1_type.type_ == V_ASN1_OCTET_STRING {
+                        let digest_octet_str =
+                            Asn1OctetStringRef::from_ptr(asn1_type.value.octet_string);
+                        let authenticode = to_hex_str(digest_octet_str.as_slice());
+                        return Some((digest_algo_str, authenticode));
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 #[allow(dead_code)]
@@ -504,20 +552,33 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
 
-                println!("Certificate CN: {}", comm_name);
-                println!("Certificate status: {}", status);
-                println!("Certificate version: V{}", version);
-                println!("Certificate SN: {}", sn);
-                println!("Certificate fingerprint: {}", fingerprint);
-                println!("Certificate algorithm: {}", algorithm);
-                println!("Certificate validity period: {} - {}", start_time, end_time);
+                let (_, authenticode) = extract_authtiencode(&indata).unwrap();
+
                 println!(
-                    "Certificate signing Time: {}",
+                    r"Certificate:
+    CN: {}
+    Status: {}
+    Version: V{}
+    SN: {}
+    Fingerprint: {}
+    Algorithm: {}
+    ValidityPeriod: {} - {}
+    SigningTime: {}
+    Authenticode: {}
+==============================================================",
+                    comm_name,
+                    status,
+                    version,
+                    sn,
+                    fingerprint,
+                    algorithm,
+                    start_time,
+                    end_time,
                     signing_time
                         .and_then(|t| Some(t.to_string()))
-                        .unwrap_or("Unknown".to_owned())
+                        .unwrap_or("Unknown".to_owned()),
+                    authenticode
                 );
-                println!("==============================================================")
             }
 
             Ok(())
