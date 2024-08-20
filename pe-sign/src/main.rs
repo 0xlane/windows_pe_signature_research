@@ -312,6 +312,9 @@ fn cli() -> clap::Command {
                         .value_parser(value_parser!(PathBuf))
                         .required(true),
                     arg!(--"no-check-time" "Ignore certificate validity time"),
+                    arg!(--"ca-file" <FILE> "Trusted certificates file")
+                        .value_parser(value_parser!(PathBuf))
+                        .default_value("cacert.pem"),
                 ]),
         )
         .subcommand(
@@ -378,6 +381,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(("verify", sub_matches)) => {
             let file = sub_matches.get_one::<PathBuf>("FILE").unwrap();
             let no_check_time = sub_matches.get_flag("no-check-time");
+            let cafile = sub_matches.get_one::<PathBuf>("ca-file").unwrap();
 
             let mut pkcs7s = vec![];
 
@@ -392,7 +396,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             for pkcs7 in pkcs7s {
                 // 加载 cacert
-                let cacert_bin = std::fs::read(".\\cacert.pem")?;
+                let cacert_bin = std::fs::read(cafile)?;
                 let mut store_builder = X509StoreBuilder::new()?;
                 let ca_certs = X509::stack_from_pem(&cacert_bin)?;
                 for ca_cert in ca_certs {

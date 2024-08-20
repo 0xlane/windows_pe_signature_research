@@ -1969,7 +1969,18 @@ fn extract_authtiencode(cert_bin: &[u8]) -> Option<(String, String)> {
 通过 pe-sign 工具验证证书并打印证书信息：
 
 ```powershell
-pe-sign verify <input_file>
+PS C:\dev\windows_pe_signature_research> pe-sign help verify
+Check the digital signature of a PE file for validity
+
+Usage: pe-sign.exe verify [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>
+
+Options:
+      --no-check-time   Ignore certificate validity time
+      --ca-file <FILE>  Trusted certificates file [default: cacert.pem]
+  -h, --help            Print help
 ```
 
 ## authenticode 计算
