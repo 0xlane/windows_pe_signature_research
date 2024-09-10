@@ -1824,6 +1824,7 @@ TSTInfo ::= SEQUENCE {
         -- TimeStampReq serialNumber INTEGER,
         -- Time Stamps users MUST be ready to accommodate integers
         -- up to 160 bits.
+    serialNumber   SerialNumber,
     genTime        GeneralizedTime,
     accuracy       Accuracy     OPTIONAL,
     ordering       BOOLEAN DEFAULT FALSE,
