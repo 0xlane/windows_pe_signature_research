@@ -2039,3 +2039,19 @@ Certificate:
 PS C:\dev\windows_pe_signature_research> pe-sign calc .\3177a0554250e2092443b00057f3919efd6d544e243444b70eb30f1f7dd9f1d1"
 ab19518250c085de397e582c33f4bb911a193ac500aa7952d318faae41a477c0
 ```
+
+## 其他 tips
+
+### RSA 公钥解密
+
+大多数工具只提供了公钥验签，不提供公钥解密功能。可以使用类似 [https://www.lddgo.net/en/encrypt/rsa](https://www.lddgo.net/en/encrypt/rsa) 的在线解密工具，对签名数据解密。
+
+### 导入系统中内置的可信任根证书
+
+打开 `cerlm.msc` 证书管理窗口，导航到“受信任的根证书颁发机构->证书”，全选后导出为 p7b。
+
+然后通过 openssl 可以转换 p7b 证书为 pem：
+
+```powershell
+openssl pkcs7 -inform DER -in win_ca.cer -print_certs -outform PEM > win_ca.pem
+```
