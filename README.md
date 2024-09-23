@@ -2055,3 +2055,24 @@ ab19518250c085de397e582c33f4bb911a193ac500aa7952d318faae41a477c0
 ```powershell
 openssl pkcs7 -inform DER -in win_ca.cer -print_certs -outform PEM > win_ca.pem
 ```
+
+不过这种方式，不知道什么原因导出的证书有时候并不全，可能有缺失。
+
+所以改用 python 的 wincertstore 库枚举系统根证书然后导出为 PEM：
+
+```python
+import wincertstore
+
+wincerts = []
+
+with wincertstore.CertSystemStore("ROOT") as store:
+     for cert in store.itercerts(usage=wincertstore.CODE_SIGNING):
+         if cert.cert_type == 'CERTIFICATE':
+            tmp = cert.get_pem()
+            if tmp not in wincerts:
+              wincerts.append(tmp)
+
+with open('c:\\cacerts.pem', 'r') as fp:
+  fp.write("\n".join(wincerts))
+
+```
